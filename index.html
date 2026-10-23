@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project Pi - Passkey PRF Test</title>
+<style>
+  body { font-family: -apple-system, system-ui, monospace; max-width: 640px; margin: 0 auto; padding: 24px; background: #F5F5F5; color: #111; }
+  h1 { font-size: 20px; } h2 { font-size: 15px; margin-top: 24px; }
+  button { display: block; width: 100%; padding: 14px; margin: 8px 0; font-size: 16px; border: 0; border-radius: 6px; cursor: pointer; }
+  #btnRegister { background: #DC143C; color: #fff; }
+  #btnAssert { background: #111; color: #fff; }
+  .result { padding: 16px; border-radius: 6px; font-size: 15px; margin-top: 16px; white-space: pre-wrap; word-break: break-all; }
+  .pass { background: #e6f4e6; border: 2px solid #2d5016; color: #2d5016; }
+  .fail { background: #fbeaea; border: 2px solid #DC143C; color: #8B0000; }
+  .info { background: #fff; border: 1px solid #C0C0C0; }
+  code { background: #eee; padding: 1px 4px; border-radius: 3px; }
+  #copyBtn { background: #fff; border: 1px solid #C0C0C0; font-size: 14px; padding: 10px; }
+  small { color: #555; }
+  .fp { font-size: 22px; font-weight: 700; letter-spacing: 2px; }
+</style>
+</head>
+<body>
+<h1>Project Pi v3 - Passkey PRF Consistency Test</h1>
+<p><small>Tests whether the WebAuthn <code>prf</code> extension returns output on this device, and whether the same passkey + same salt produces the same fingerprint everywhere. Register ONCE on iPhone Safari (iCloud Keychain syncs the passkey), then run the authenticate step on every device. Never displays the raw PRF output, only SHA-256 fingerprints.</small></p>
+
+<h2>Step A: Register passkey <small>(iPhone Safari only, once)</small></h2>
+<button id="btnRegister">Register passkey (iPhone)</button>
+
+<h2>Step B: Authenticate with synced passkey <small>(every device/browser)</small></h2>
+<button id="btnAssert">Authenticate and fingerprint PRF</button>
+<p><small>Mac Chrome: first try the passkey it offers you directly (iCloud Keychain path). If it cannot find one, choose "Use a phone or tablet" and scan the QR with the iPhone. The test records which path was used.</small></p>
+
+<h2>Result</h2>
+<div id="out" class="result info">Waiting...</div>
+<div id="fpBox" style="display:none">Fingerprint (SHA-256, first 16 hex): <span class="fp" id="fp"></span></div>
+<button id="copyBtn" style="display:none">Copy result JSON (paste it back to Devin)</button>
+<div id="ua" class="result info" style="font-size:12px"></div>
+
+<script>
+const out = document.getElementById('out');
+const copyBtn = document.getElementById('copyBtn');
+const fpBox = document.getElementById('fpBox');
+document.getElementById('ua').textContent = 'UA: ' + navigator.userAgent;
+
+// FIXED salt: identical across all devices and runs. Not secret.
+const FIXED_SALT = Uint8Array.from([
+  0x70,0x69,0x2d,0x70,0x72,0x66,0x2d,0x74,0x65,0x73,0x74,0x2d,0x76,0x31,0x2d,0x73,
+  0x61,0x6c,0x74,0x2d,0x64,0x6f,0x2d,0x6e,0x6f,0x74,0x2d,0x63,0x68,0x61,0x6e,0x67
+]).buffer; // "pi-prf-test-v1-salt-do-not-chang"
+
+function rand(n) { const a = new Uint8Array(n); crypto.getRandomValues(a); return a.buffer; }
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+async function sha256hex(buf) {
+  const h = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2,'0')).join('');
+}
+function guessBrowser() {
+  const ua = navigator.userAgent;
+  if (/CriOS/.test(ua)) return 'Chrome iOS';
+  if (/FxiOS/.test(ua)) return 'Firefox iOS';
+  if (/Edg/.test(ua)) return 'Edge';
+  if (/Chrome/.test(ua)) return 'Chrome';
+  if (/Safari/.test(ua)) return 'Safari';
+  return 'Other';
+}
+function guessOS() {
+  const ua = navigator.userAgent;
+  const m = ua.match(/OS (\d+[_\.]\d+([_\.]\d+)?)/);
+  if (/iPhone|iPad/.test(ua)) return 'iOS ' + (m ? m[1].replace(/_/g,'.') : '?');
+  if (/Mac OS X/.test(ua)) return 'macOS ' + (m ? m[1].replace(/_/g,'.') : ua.match(/Mac OS X ([\d_]+)/)?.[1].replace(/_/g,'.') || '?');
+  if (/Windows/.test(ua)) return 'Windows';
+  if (/Android/.test(ua)) return 'Android';
+  return 'Other';
+}
+
+const result = {
+  browser: guessBrowser(),
+  os: guessOS(),
+  userAgent: navigator.userAgent,
+  credentialId: null,
+  authenticatorTransport: null,   // 'platform' = direct keychain, 'cross-platform' = QR/hybrid
+  prfEnabledAtRegistration: null,
+  prfReturned: null,
+  fingerprint: null,
+  error: null,
+};
+
+function show(cls, msg) { out.className = 'result ' + cls; out.textContent = msg; }
+function finish() {
+  copyBtn.style.display = 'block';
+  copyBtn.onclick = () => {
+    navigator.clipboard.writeText(JSON.stringify(result, null, 2));
+    copyBtn.textContent = 'Copied - paste this to Devin';
+  };
+}
+
+if (!window.PublicKeyCredential) {
+  result.error = 'WebAuthn unsupported';
+  show('fail', 'FAIL: WebAuthn not supported in this browser.');
+  finish();
+}
+
+document.getElementById('btnRegister').onclick = async () => {
+  try {
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: rand(32),
+      rp: { name: 'Pi PRF Test' },   // rp.id omitted: defaults to this origin
+      user: { id: rand(16), name: 'pi-prf-test@pi', displayName: 'Pi PRF Test' },
+      pubKeyCredParams: [
+        { type: 'public-key', alg: -7 },
+        { type: 'public-key', alg: -257 }
+      ],
+      authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+      extensions: { prf: {} }
+    }});
+    result.credentialId = b64url(cred.rawId);
+    const ext = cred.getClientExtensionResults();
+    result.prfEnabledAtRegistration = (ext && ext.prf && typeof ext.prf.enabled === 'boolean')
+      ? ext.prf.enabled : 'not-reported';
+    show('info', 'Passkey registered.\ncredentialId: ' + result.credentialId +
+      '\nprf.enabled reported: ' + result.prfEnabledAtRegistration +
+      '\n\nNow run Step B on this device AND on Mac Safari + Mac Chrome.');
+    finish();
+  } catch (e) {
+    result.error = 'register: ' + e;
+    show('fail', 'FAIL at registration: ' + e);
+    finish();
+  }
+};
+
+document.getElementById('btnAssert').onclick = async () => {
+  try {
+    const assertion = await navigator.credentials.get({ publicKey: {
+      challenge: rand(32),
+      allowCredentials: [],   // let the platform offer synced passkeys / hybrid QR
+      userVerification: 'required',
+      extensions: { prf: { eval: { first: FIXED_SALT } } }
+    }});
+    result.credentialId = result.credentialId || b64url(assertion.rawId);
+    result.authenticatorTransport = assertion.authenticatorAttachment || 'unknown';
+    const ext = assertion.getClientExtensionResults();
+    const prfResult = ext && ext.prf && ext.prf.results && ext.prf.results.first;
+    if (prfResult && prfResult.byteLength >= 32) {
+      result.prfReturned = true;
+      const hex = await sha256hex(prfResult);
+      result.fingerprint = hex.slice(0, 16);
+      fpBox.style.display = 'block';
+      document.getElementById('fp').textContent = result.fingerprint;
+      show('pass', 'PRF output returned (' + prfResult.byteLength + ' bytes).\nFingerprint: ' + result.fingerprint +
+        '\nTransport: ' + result.authenticatorTransport +
+        '\n\nCompare fingerprints across iPhone Safari, Mac Safari and Mac Chrome. All three must MATCH.');
+      finish();
+    } else {
+      result.prfReturned = false;
+      result.error = 'no prf in extension results: ' + JSON.stringify(ext);
+      show('fail', 'FAIL: assertion succeeded but NO PRF output returned.\nExtension results: ' + JSON.stringify(ext));
+      finish();
+    }
+  } catch (e) {
+    result.prfReturned = false;
+    result.error = 'assert: ' + e;
+    show('fail', 'FAIL at authentication: ' + e);
+    finish();
+  }
+};
+</script>
+</body>
+</html>
