@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pi Argon2id benchmark</title>
+<style>
+  body { font-family: -apple-system, monospace; background:#fff; color:#000; padding:24px; max-width:760px; margin:auto; }
+  button { font-size:18px; padding:12px 18px; background:#DC143C; color:#fff; border:0; border-radius:8px; margin:8px 0; }
+  button:hover { background:#8B0000; }
+  table { border-collapse: collapse; width:100%; margin-top:16px; }
+  td, th { border:1px solid #C0C0C0; padding:8px; font-size:14px; text-align:left; }
+  #log { white-space:pre-wrap; background:#F5F5F5; padding:12px; font-size:13px; margin-top:16px; }
+  .note { color:#555; font-size:13px; }
+</style>
+</head>
+<body>
+<h1>Pi Argon2id benchmark</h1>
+<p class="note">Times Argon2id at several MEMLIMIT/OPSLIMIT settings using the
+same libsodium.js sumo build as the PWA. Runs each config twice and reports
+the median. A config is marked CRASH if the run throws or never returns.
+Run on iPhone Safari and Mac Safari, then send back the result JSON.</p>
+<button id="run">Run benchmark</button>
+<button id="copy" disabled>Copy result JSON</button>
+<div id="log"></div>
+<table id="results" hidden>
+  <tr><th>MEMLIMIT</th><th>OPSLIMIT</th><th>median ms</th><th>status</th></tr>
+</table>
+<script src="libsodium-sumo.js"></script>
+<script src="libsodium-wrappers.js"></script>
+<script>
+const CONFIGS = []
+for (const mem of [64, 128, 256]) {
+  for (const ops of [2, 3, 4]) {
+    CONFIGS.push({ memlimit: mem * 1048576, opslimit: ops })
+  }
+}
+const PASSWORD = "benchmark-password"
+const log = (m) => { document.getElementById('log').textContent += m + "\n" }
+const results = []
+
+async function once(sodium, memlimit, opslimit) {
+  const salt = sodium.randombytes_buf(16)
+  const t0 = performance.now()
+  sodium.crypto_pwhash(
+    32, PASSWORD, salt, opslimit, memlimit,
+    sodium.crypto_pwhash_ALG_ARGON2ID13)
+  return performance.now() - t0
+}
+
+document.getElementById('run').onclick = async () => {
+  const btn = document.getElementById('run'); btn.disabled = true
+  log("loading libsodium (sumo)...")
+  try {
+    await sodium.ready
+    log("libsodium ready. running " + CONFIGS.length + " configs x2 runs...\n")
+    const table = document.getElementById('results')
+    table.hidden = false
+    for (const cfg of CONFIGS) {
+      const mem = cfg.memlimit / 1048576, ops = cfg.opslimit
+      try {
+        const times = []
+        for (let i = 0; i < 2; i++) {
+          // yield so the page stays responsive / Safari doesn't kill us
+          await new Promise(r => setTimeout(r, 50))
+          times.push(await once(sodium, cfg.memlimit, cfg.opslimit))
+        }
+        times.sort((a, b) => a - b)
+        const median = times[Math.floor(times.length / 2)]
+        const row = { memlimit_mib: mem, opslimit: ops, median_ms: Math.round(median), status: "ok" }
+        results.push(row)
+        table.innerHTML += `<tr><td>${mem} MiB</td><td>${ops}</td><td>${row.median_ms}</td><td>ok</td></tr>`
+        log(`${mem} MiB / ops ${ops}: ${Math.round(times[0])} ms, ${Math.round(times[1])} ms`)
+      } catch (e) {
+        results.push({ memlimit_mib: mem, opslimit: ops, median_ms: null, status: "crash", error: String(e).slice(0, 200) })
+        table.innerHTML += `<tr><td>${mem} MiB</td><td>${ops}</td><td>-</td><td>CRASH</td></tr>`
+        log(`${mem} MiB / ops ${ops}: CRASH ${e}`)
+      }
+    }
+    log("\ndone.")
+    document.getElementById('copy').disabled = false
+  } catch (e) {
+    log("FATAL: " + e)
+    results.push({ fatal: String(e) })
+    document.getElementById('copy').disabled = false
+  }
+}
+
+document.getElementById('copy').onclick = () => {
+  const out = {
+    test: "argon2-bench-v1",
+    userAgent: navigator.userAgent,
+    results,
+    timestamp: new Date().toISOString(),
+  }
+  navigator.clipboard.writeText(JSON.stringify(out, null, 2)).then(
+    () => log("copied."),
+    () => { log("clipboard failed; select and copy manually:"); log(JSON.stringify(out, null, 2)) }
+  )
+}
+</script>
+</body>
+</html>
